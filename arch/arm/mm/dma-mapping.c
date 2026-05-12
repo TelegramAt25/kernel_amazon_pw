@@ -145,6 +145,7 @@ static struct arm_vm_region *arm_vm_region_find(struct arm_vm_region *head, unsi
 #error ARM Coherent DMA allocator does not (yet) support huge TLB
 #endif
 
+unsigned int dma_reserved_count;
 static void *
 __dma_alloc(struct device *dev, size_t size, dma_addr_t *handle, gfp_t gfp,
 	    pgprot_t prot)
@@ -240,6 +241,7 @@ __dma_alloc(struct device *dev, size_t size, dma_addr_t *handle, gfp_t gfp,
 			 * x86 does not mark the pages reserved...
 			 */
 			SetPageReserved(page);
+			dma_reserved_count++;
 			set_pte_ext(pte, mk_pte(page, prot), 0);
 			page++;
 			pte++;
@@ -366,7 +368,9 @@ void dma_free_coherent(struct device *dev, size_t size, void *cpu_addr, dma_addr
 	int idx;
 	u32 off;
 
+#ifdef CONFIG_SMP
 	WARN_ON(irqs_disabled());
+#endif
 
 	if (dma_release_from_coherent(dev, get_order(size), cpu_addr))
 		return;
@@ -419,6 +423,7 @@ void dma_free_coherent(struct device *dev, size_t size, void *cpu_addr, dma_addr
 				 * x86 does not mark the pages reserved...
 				 */
 				ClearPageReserved(page);
+				dma_reserved_count--;
 
 				__free_page(page);
 				continue;

@@ -72,10 +72,18 @@ __tagtable(ATAG_INITRD2, parse_tag_initrd2);
  */
 struct meminfo meminfo;
 
+struct meminfo *get_meminfo()
+{
+	return &meminfo;
+}
+extern unsigned int dma_reserved_count;
+extern unsigned int rss_sum_by_tasks();
+
 void show_mem(void)
 {
-	int free = 0, total = 0, reserved = 0;
-	int shared = 0, cached = 0, slab = 0, node, i;
+	int free = 0, total = 0, reserved = 0, sharedp = 0, sharedp_mapped = 0;
+	int shared = 0, cached = 0, slab = 0, node, i, shared_mapped = 0, user_pages =0;
+	int user_cache =0, kernel_cache = 0;
 	struct meminfo * mi = &meminfo;
 
 	printk("Mem-info:\n");
@@ -105,8 +113,20 @@ void show_mem(void)
 					slab++;
 				else if (!page_count(page))
 					free++;
-				else
-					shared += page_count(page) - 1;
+				else { 
+                                        shared += page_count(page) - 1;
+                                        if (page_count(page) > 1)
+                                                sharedp++;
+                                        if (page_mapped(page)) {
+                                                if (page_mapcount(page) > 1)
+                                                        sharedp_mapped++;
+                                                shared_mapped += page_mapcount(page) - 1;
+                                                user_pages++;
+						if (page_mapping(page))
+                                                        user_cache++;
+                                        } else if (page_mapping(page))
+                                                        kernel_cache++;
+                                }
 				page++;
 			} while (page < end);
 		}
@@ -116,8 +136,17 @@ void show_mem(void)
 	printk("%d free pages\n", free);
 	printk("%d reserved pages\n", reserved);
 	printk("%d slab pages\n", slab);
-	printk("%d pages shared\n", shared);
+	printk("%d shared page count\n", shared);
+	printk("%d shared pages\n",sharedp);
+	printk("%d mapped shared page count\n", shared_mapped);
+        printk("%d mapped shared pages\n",sharedp_mapped);
 	printk("%d pages swap cached\n", cached);
+	printk("%d dma reserved pages\n",dma_reserved_count);
+	printk("%d total user pages\n",user_pages);
+	printk("%d RSS sum by tasks\n",rss_sum_by_tasks());
+	printk("%d RSS sum by page stats\n", user_pages+shared_mapped);
+	printk("%d user cache pages\n", user_cache);
+	printk("%d kernel cache pages\n", kernel_cache);
 }
 
 static void __init find_node_limits(int node, struct meminfo *mi,

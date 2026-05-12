@@ -6,6 +6,7 @@
  * published by the Free Software Foundation.
  *
  * Derived from pxa PWM driver by eric miao <eric.miao@marvell.com>
+ * Copyright 2009-2010 Freescale Semiconductor, Inc. All Rights Reserved.
  */
 
 #include <linux/module.h>
@@ -28,13 +29,23 @@
 /* i.MX27, i.MX31, i.MX35 share the same PWM function block: */
 
 #define MX3_PWMCR                 0x00    /* PWM Control Register */
+#define MX3_PWMSR                 0x04    /* PWM Status Register */
 #define MX3_PWMSAR                0x0C    /* PWM Sample Register */
 #define MX3_PWMPR                 0x10    /* PWM Period Register */
 #define MX3_PWMCR_PRESCALER(x)    (((x - 1) & 0xFFF) << 4)
 #define MX3_PWMCR_CLKSRC_IPG_HIGH (2 << 16)
 #define MX3_PWMCR_EN              (1 << 0)
 
+#define MX3_PWMCR_FWM				(2 << 26)
+#define MX3_PWMCR_STOPEN            (1 << 25)
+#define MX3_PWMCR_DOZEEN            (1 << 24)
+#define MX3_PWMCR_WAITEN            (1 << 23)
+#define MX3_PWMCR_DBGEN	            (1 << 22)
+#define MX3_PWMCR_CLKSRC_IPG        (1 << 16)
+#define MX3_PWMCR_CLKSRC_IPG_32k    (3 << 16)
+#define MX3_PWMCR_SOFT_RESET		(1 << 3)
 
+#define MX3_PWMSR_WORDS_FIFO		(7 << 0)
 
 struct pwm_device {
 	struct list_head	node;
@@ -55,9 +66,11 @@ int pwm_config(struct pwm_device *pwm, int duty_ns, int period_ns)
 	if (pwm == NULL || period_ns == 0 || duty_ns > period_ns)
 		return -EINVAL;
 
-	if (cpu_is_mx27() || cpu_is_mx3()) {
+	if (cpu_is_mx27() || cpu_is_mx3() || cpu_is_mx5()) {
 		unsigned long long c;
 		unsigned long period_cycles, duty_cycles, prescale;
+		u32 cr;
+
 		c = clk_get_rate(pwm->clk);
 		c = c * period_ns;
 		do_div(c, 1000000000);
@@ -66,14 +79,35 @@ int pwm_config(struct pwm_device *pwm, int duty_ns, int period_ns)
 		prescale = period_cycles / 0x10000 + 1;
 
 		period_cycles /= prescale;
-		c = (unsigned long long)period_cycles * duty_ns;
+
+		/* the chip document says the counter counts up to
+		 * period_cycles + 1 and then is reset to 0, so the
+		 *  actual period of the PWM wave is period_cycles + 2
+		 */
+		c = (unsigned long long)(period_cycles + 2) * duty_ns;
 		do_div(c, period_ns);
 		duty_cycles = c;
 
+		/* Ensure the the FIFO is not FULL when the sample register is written. */
+		cr = readl(pwm->mmio_base + MX3_PWMSR) & MX3_PWMSR_WORDS_FIFO;
+		while (cr >= 3 && pwm->clk_enabled)
+			cr = readl(pwm->mmio_base + MX3_PWMSR) & MX3_PWMSR_WORDS_FIFO;
+		if (cr == 4 && !pwm->clk_enabled) {
+			/* Reset the FIFO  before writing any new value to the Sample Register.
+			 * Writes to the sample register will fail if the FIFO is FULL.
+			 */
+			cr = readl(pwm->mmio_base + MX3_PWMCR);
+			cr |= MX3_PWMCR_SOFT_RESET;
+			writel (cr, pwm->mmio_base + MX3_PWMCR);
+			while (readl(pwm->mmio_base + MX3_PWMCR) & MX3_PWMCR_SOFT_RESET);
+		}
+
 		writel(duty_cycles, pwm->mmio_base + MX3_PWMSAR);
 		writel(period_cycles, pwm->mmio_base + MX3_PWMPR);
-		writel(MX3_PWMCR_PRESCALER(prescale - 1) |
-			MX3_PWMCR_CLKSRC_IPG_HIGH | MX3_PWMCR_EN,
+		writel(MX3_PWMCR_PRESCALER(prescale) |
+			MX3_PWMCR_CLKSRC_IPG_HIGH |
+			MX3_PWMCR_STOPEN | MX3_PWMCR_DOZEEN |
+			MX3_PWMCR_WAITEN | MX3_PWMCR_DBGEN | MX3_PWMCR_FWM,
 			pwm->mmio_base + MX3_PWMCR);
 	} else if (cpu_is_mx1() || cpu_is_mx21()) {
 		/* The PWM subsystem allows for exact frequencies. However,
@@ -105,6 +139,7 @@ EXPORT_SYMBOL(pwm_config);
 
 int pwm_enable(struct pwm_device *pwm)
 {
+	unsigned long reg;
 	int rc = 0;
 
 	if (!pwm->clk_enabled) {
@@ -112,16 +147,27 @@ int pwm_enable(struct pwm_device *pwm)
 		if (!rc)
 			pwm->clk_enabled = 1;
 	}
+
+	reg = readl(pwm->mmio_base + MX3_PWMCR);
+	reg |= MX3_PWMCR_EN;
+	writel(reg, pwm->mmio_base + MX3_PWMCR);
 	return rc;
 }
 EXPORT_SYMBOL(pwm_enable);
 
 void pwm_disable(struct pwm_device *pwm)
 {
+	unsigned long reg;
+
 	if (pwm->clk_enabled) {
 		clk_disable(pwm->clk);
 		pwm->clk_enabled = 0;
 	}
+
+	reg = readl(pwm->mmio_base + MX3_PWMCR);
+	reg &= ~MX3_PWMCR_EN;
+	writel(reg, pwm->mmio_base + MX3_PWMCR);
+
 }
 EXPORT_SYMBOL(pwm_disable);
 
