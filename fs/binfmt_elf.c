@@ -1402,8 +1402,9 @@ static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
 	SET_UID(psinfo->pr_uid, cred->uid);
 	SET_GID(psinfo->pr_gid, cred->gid);
 	rcu_read_unlock();
-	strncpy(psinfo->pr_fname, p->comm, sizeof(psinfo->pr_fname));
-	
+	strncpy(psinfo->pr_fname, p->comm, sizeof(psinfo->pr_fname) - 1);
+	psinfo->pr_fname[sizeof(psinfo->pr_fname) - 1] = 0;
+
 	return 0;
 }
 

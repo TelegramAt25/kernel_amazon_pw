@@ -13,10 +13,42 @@
 #include <asm/atomic.h>
 #include <asm/page.h>
 #include <asm/pgtable.h>
+#include <asm/setup.h>
 #include "internal.h"
 
 void __attribute__((weak)) arch_report_meminfo(struct seq_file *m)
 {
+}
+
+extern struct meminfo *get_meminfo(void);
+extern unsigned int dma_reserved_count;
+
+unsigned int rss_sum_by_tasks()
+{
+	unsigned int rss_sum = 0;
+	struct task_struct *g, *p;
+	do_each_thread(g, p) {
+		struct mm_struct *mm;
+
+		if (!thread_group_leader(p))
+			continue;
+
+		task_lock(p);
+		mm = p->mm;
+		if (!mm) {
+			/*
+			 * total_vm and rss sizes do not exist for tasks with no
+			 * mm so there's no need to report them; they can't be
+			 * oom killed anyway.
+			 */
+			task_unlock(p);
+			continue;
+		}
+		rss_sum += get_mm_rss(mm);
+		task_unlock(p);
+	} while_each_thread(g, p);
+
+	return rss_sum;
 }
 
 static int meminfo_proc_show(struct seq_file *m, void *v)
@@ -29,6 +61,58 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 	unsigned long pages[NR_LRU_LISTS];
 	int lru;
 
+	unsigned long free = 0, total = 0, reserved = 0, sharedp = 0, sharedp_mapped = 0;
+	unsigned long shared = 0, pcached = 0, slab = 0, shared_mapped = 0, user_pages = 0;
+	unsigned long user_cache = 0, kernel_cache = 0;
+	{
+		int node, i;
+		struct meminfo * mi = get_meminfo();
+	for_each_online_node(node) {
+		pg_data_t *n = NODE_DATA(node);
+		struct page *map = pgdat_page_nr(n, 0) - n->node_start_pfn;
+
+		for_each_nodebank (i,mi,node) {
+			struct membank *bank = &mi->bank[i];
+			unsigned int pfn1, pfn2;
+			struct page *page, *end;
+
+			pfn1 = bank_pfn_start(bank);
+			pfn2 = bank_pfn_end(bank);
+
+			page = map + pfn1;
+			end  = map + pfn2;
+
+			do {
+				total++;
+				if (PageReserved(page))
+					reserved++;
+				else if (PageSwapCache(page))
+					pcached++;
+				else if (PageSlab(page))
+					slab++;
+				else if (!page_count(page))
+					free++;
+				else {
+					shared += page_count(page) - 1;
+					if (page_count(page) > 1)
+						sharedp++;
+					if (page_mapped(page)) {
+						if (page_mapcount(page) > 1)
+							sharedp_mapped++;
+						shared_mapped += page_mapcount(page) - 1;
+						user_pages++;
+						if (page_mapping(page))
+							user_cache++;
+					} else if (page_mapping(page))
+							kernel_cache++;
+				}
+				page++;
+			} while (page < end);
+		}
+	}
+
+
+	}
 /*
  * display in kilobytes.
  */
@@ -95,7 +179,24 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 		"Committed_AS:   %8lu kB\n"
 		"VmallocTotal:   %8lu kB\n"
 		"VmallocUsed:    %8lu kB\n"
-		"VmallocChunk:   %8lu kB\n",
+		"VmallocChunk:   %8lu kB\n"
+		"=================================\n"
+		"Total RAM:            %8lu kB\n" //, total
+		"Free                  %8lu kB\n" //, free
+		"reserved              %8lu kB\n" //, reserved
+		"slab                  %8lu kB\n" //, slab
+		"shared page count     %8lu\n"    //, shared
+		"shared pages          %8lu kB\n"
+		"swap cached           %8lu\n"    //, cached
+		"dma reserved          %8lu kB\n"
+		"mapped shared count   %8lu\n"
+		"mapped shared         %8lu kB\n"
+		"total user            %8lu kB\n"
+		"RSS sum by tasks      %8lu\n"
+		"RSS sum by page stats %8lu\n"
+		"user cache            %8lu kB\n"
+		"kernel cache          %8lu kB\n"
+		"kernel total          %8lu kB (Reserved + Slab + PageTables + Dirty)\n",
 		K(i.totalram),
 		K(i.freeram),
 		K(i.bufferram),
@@ -139,7 +240,25 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
 		K(committed),
 		(unsigned long)VMALLOC_TOTAL >> 10,
 		vmi.used >> 10,
-		vmi.largest_chunk >> 10
+		vmi.largest_chunk >> 10,
+		/*"=========================\n" */
+		K(total),
+		K(free),
+		K(reserved),
+		K(slab),
+		shared,
+		K(sharedp),
+		pcached,
+		K((unsigned long)dma_reserved_count),
+		shared_mapped,
+		K(sharedp_mapped),
+		K(user_pages),
+		(unsigned long)rss_sum_by_tasks(),
+		user_pages + shared_mapped,
+		K(user_cache),
+		K(kernel_cache),
+		K(reserved + slab + global_page_state(NR_PAGETABLE) +
+				global_page_state(NR_FILE_DIRTY))
 		);
 
 	hugetlb_report_meminfo(m);
