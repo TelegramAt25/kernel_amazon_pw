@@ -62,7 +62,7 @@ static inline struct anon_vma *anon_vma_alloc(void)
 	return kmem_cache_alloc(anon_vma_cachep, GFP_KERNEL);
 }
 
-static inline void anon_vma_free(struct anon_vma *anon_vma)
+void anon_vma_free(struct anon_vma *anon_vma)
 {
 	kmem_cache_free(anon_vma_cachep, anon_vma);
 }
@@ -166,7 +166,7 @@ void anon_vma_unlink(struct vm_area_struct *vma)
 	list_del(&vma->anon_vma_node);
 
 	/* We must garbage collect the anon_vma if it's empty */
-	empty = list_empty(&anon_vma->head);
+	empty = list_empty(&anon_vma->head) && !anonvma_external_refcount(anon_vma);
 	spin_unlock(&anon_vma->lock);
 
 	if (empty)
@@ -178,6 +178,7 @@ static void anon_vma_ctor(void *data)
 	struct anon_vma *anon_vma = data;
 
 	spin_lock_init(&anon_vma->lock);
+	anonvma_external_refcount_init(anon_vma);
 	INIT_LIST_HEAD(&anon_vma->head);
 }
 
@@ -198,7 +199,7 @@ static struct anon_vma *page_lock_anon_vma(struct page *page)
 
 	rcu_read_lock();
 	anon_mapping = (unsigned long) page->mapping;
-	if (!(anon_mapping & PAGE_MAPPING_ANON))
+	if ((anon_mapping & PAGE_MAPPING_FLAGS) != PAGE_MAPPING_ANON)
 		goto out;
 	if (!page_mapped(page))
 		goto out;
@@ -243,8 +244,7 @@ vma_address(struct page *page, struct vm_area_struct *vma)
 unsigned long page_address_in_vma(struct page *page, struct vm_area_struct *vma)
 {
 	if (PageAnon(page)) {
-		if ((void *)vma->anon_vma !=
-		    (void *)page->mapping - PAGE_MAPPING_ANON)
+		if (vma->anon_vma != page_anon_vma(page))
 			return -EFAULT;
 	} else if (page->mapping && !(vma->vm_flags & VM_NONLINEAR)) {
 		if (!vma->vm_file ||
@@ -507,7 +507,7 @@ int page_referenced(struct page *page,
 		referenced++;
 
 	*vm_flags = 0;
-	if (page_mapped(page) && page->mapping) {
+	if (page_mapped(page) && page_rmapping(page)) {
 		if (PageAnon(page))
 			referenced += page_referenced_anon(page, mem_cont,
 								vm_flags);
