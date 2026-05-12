@@ -41,12 +41,12 @@ static inline void sync_writel(unsigned long val, unsigned long reg,
 {
 	unsigned long flags;
 
-	atomic_spin_lock_irqsave(&l2x0_lock, flags);
+	spin_lock_irqsave(&l2x0_lock, flags);
 	writel(val, l2x0_base + reg);
 	/* wait for the operation to complete */
 	while (readl(l2x0_base + reg) & complete_mask)
 		;
-	atomic_spin_unlock_irqrestore(&l2x0_lock, flags);
+	spin_unlock_irqrestore(&l2x0_lock, flags);
 }
 
 static inline void cache_sync(void)
