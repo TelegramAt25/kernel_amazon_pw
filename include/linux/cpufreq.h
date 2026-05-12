@@ -94,7 +94,7 @@ struct cpufreq_policy {
         unsigned int		policy; /* see above */
 	struct cpufreq_governor	*governor; /* see below */
 
-	struct work_struct	update; /* if update_policy() needs to be
+	struct delayed_work	update; /* if update_policy() needs to be
 					 * called, but you're in IRQ context */
 
 	struct cpufreq_real_policy	user_policy;
@@ -170,6 +170,9 @@ struct cpufreq_governor {
 					 char *buf);
 	int 	(*store_setspeed)	(struct cpufreq_policy *policy,
 					 unsigned int freq);
+#ifdef CONFIG_CPU_FREQ_OVERRIDE_LAB126
+	int     (*override) (struct cpufreq_policy *policy, unsigned int is_override);
+#endif
 	unsigned int max_transition_latency; /* HW must be able to switch to
 			next freq faster than this value in nano secs or we
 			will fallback to performance governor */
@@ -283,6 +286,11 @@ int cpufreq_update_policy(unsigned int cpu);
 
 /* query the current CPU frequency (in kHz). If zero, cpufreq couldn't detect it */
 unsigned int cpufreq_get(unsigned int cpu);
+
+#ifdef CONFIG_CPU_FREQ_OVERRIDE_LAB126
+/* LAB126: Call the driver override */
+unsigned int cpufreq_override(unsigned int is_override);
+#endif
 
 /* query the last known CPU freq (in kHz). If zero, cpufreq couldn't detect it */
 #ifdef CONFIG_CPU_FREQ
