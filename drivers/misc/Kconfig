@@ -262,6 +262,37 @@ config ISL29003
 	  This driver can also be built as a module.  If so, the module
 	  will be called isl29003.
 
+config MXS_PERSISTENT
+	tristate "MX23/MX28 persistent bit"
+	depends on ARCH_MXS
+	default y
+
+config YOSHIME_FL
+	tristate "Yoshime Front Light"
+	depends on MACH_MX50_YOSHIME
+	default y
+	help
+	  If you say yes here you get support for the front light on Yoshime 
+	  based devices.
+
+choice 
+	prompt "Yoshime FL Type"
+	default YOSHIME_FL_PWM
+
+config YOSHIME_FL_PWM
+	bool "Yoshime FL PWM"
+	depends on YOSHIME_FL && HAVE_PWM
+	help
+	  Support for front-light with PWM control
+
+config YOSHIME_FL_OWIRE
+	bool "Yoshime FL 1-Wire"
+	depends on YOSHIME_FL
+	help
+	  Support for front-light with 1-wire GPIO control
+
+endchoice
+
 source "drivers/misc/c2port/Kconfig"
 source "drivers/misc/eeprom/Kconfig"
 source "drivers/misc/cb710/Kconfig"

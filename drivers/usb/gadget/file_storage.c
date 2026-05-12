@@ -1,8 +1,10 @@
 /*
  * file_storage.c -- File-backed USB Storage Gadget, for USB development
  *
- * Copyright (C) 2003-2008 Alan Stern
+ * Copyright (C) 2003-2007 Alan Stern
  * All rights reserved.
+ *
+ * Copyright (C) 2010-2011 Amazon.com Inc. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -38,17 +40,16 @@
 
 /*
  * The File-backed Storage Gadget acts as a USB Mass Storage device,
- * appearing to the host as a disk drive or as a CD-ROM drive.  In addition
- * to providing an example of a genuinely useful gadget driver for a USB
- * device, it also illustrates a technique of double-buffering for increased
- * throughput.  Last but not least, it gives an easy way to probe the
- * behavior of the Mass Storage drivers in a USB host.
+ * appearing to the host as a disk drive.  In addition to providing an
+ * example of a genuinely useful gadget driver for a USB device, it also
+ * illustrates a technique of double-buffering for increased throughput.
+ * Last but not least, it gives an easy way to probe the behavior of the
+ * Mass Storage drivers in a USB host.
  *
  * Backing storage is provided by a regular file or a block device, specified
  * by the "file" module parameter.  Access can be limited to read-only by
- * setting the optional "ro" module parameter.  (For CD-ROM emulation,
- * access is always read-only.)  The gadget will indicate that it has
- * removable media if the optional "removable" module parameter is set.
+ * setting the optional "ro" module parameter.  The gadget will indicate that
+ * it has removable media if the optional "removable" module parameter is set.
  *
  * The gadget supports the Control-Bulk (CB), Control-Bulk-Interrupt (CBI),
  * and Bulk-Only (also known as Bulk-Bulk-Bulk or BBB) transports, selected
@@ -65,12 +66,7 @@
  * The default number of LUNs is taken from the number of "file" elements;
  * it is 1 if "file" is not given.  If "removable" is not set then a backing
  * file must be specified for each LUN.  If it is set, then an unspecified
- * or empty backing filename means the LUN's medium is not loaded.  Ideally
- * each LUN would be settable independently as a disk drive or a CD-ROM
- * drive, but currently all LUNs have to be the same type.  The CD-ROM
- * emulation includes a single data track and no audio tracks; hence there
- * need be only one backing file per LUN.  Note also that the CD-ROM block
- * length is set to 512 rather than the more common value 2048.
+ * or empty backing filename means the LUN's medium is not loaded.
  *
  * Requirements are modest; only a bulk-in and a bulk-out endpoint are
  * needed (an interrupt-out endpoint is also needed for CBI).  The memory
@@ -97,8 +93,6 @@
  *					USB device controller (usually true),
  *					boolean to permit the driver to halt
  *					bulk endpoints
- *	cdrom			Default false, boolean for whether to emulate
- *					a CD-ROM drive
  *	transport=XXX		Default BBB, transport name (CB, CBI, or BBB)
  *	protocol=YYY		Default SCSI, protocol name (RBC, 8020 or
  *					ATAPI, QIC, UFI, 8070, or SCSI;
@@ -111,16 +105,15 @@
  *					PAGE_CACHE_SIZE)
  *
  * If CONFIG_USB_FILE_STORAGE_TEST is not set, only the "file", "ro",
- * "removable", "luns", "stall", and "cdrom" options are available; default
- * values are used for everything else.
+ * "removable", "luns", and "stall" options are available; default values
+ * are used for everything else.
  *
  * The pathnames of the backing files and the ro settings are available in
  * the attribute files "file" and "ro" in the lun<n> subdirectory of the
  * gadget's sysfs directory.  If the "removable" option is set, writing to
  * these files will simulate ejecting/loading the medium (writing an empty
  * line means eject) and adjusting a write-enable tab.  Changes to the ro
- * setting are not allowed when the medium is loaded or if CD-ROM emulation
- * is being used.
+ * setting are not allowed when the medium is loaded.
  *
  * This gadget driver is heavily based on "Gadget Zero" by David Brownell.
  * The driver's SCSI command interface was based on the "Information
@@ -238,6 +231,7 @@
 #include <linux/fcntl.h>
 #include <linux/file.h>
 #include <linux/fs.h>
+#include <linux/interrupt.h>
 #include <linux/kref.h>
 #include <linux/kthread.h>
 #include <linux/limits.h>
@@ -248,22 +242,11 @@
 #include <linux/freezer.h>
 #include <linux/utsname.h>
 
-#include <asm/unaligned.h>
-
 #include <linux/usb/ch9.h>
 #include <linux/usb/gadget.h>
+#include <asm/bug.h>
+#include <mach/boot_globals.h>
 
-#include "gadget_chips.h"
-
-
-
-/*
- * Kbuild is not very cooperative with respect to linking separately
- * compiled library objects into one module.  So for now we won't use
- * separate compilation ... ensuring init/exit sections work to shrink
- * the runtime footprint, and giving us at least some parts of what
- * a "gcc --combine ... part1.c part2.c part3.c ... " build would.
- */
 #include "usbstring.c"
 #include "config.c"
 #include "epautoconf.c"
@@ -272,7 +255,7 @@
 
 #define DRIVER_DESC		"File-backed Storage Gadget"
 #define DRIVER_NAME		"g_file_storage"
-#define DRIVER_VERSION		"20 November 2008"
+#define DRIVER_VERSION		"7 August 2007"
 
 static const char longname[] = DRIVER_DESC;
 static const char shortname[] = DRIVER_NAME;
@@ -285,8 +268,31 @@ MODULE_LICENSE("Dual BSD/GPL");
  *
  * DO NOT REUSE THESE IDs with any other driver!!  Ever!!
  * Instead:  allocate your own, using normal USB-IF procedures. */
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+
+#include <mach/boardid.h>
+
+#define DRIVER_VENDOR_ID	0x1949  // Lab126
+#define DRIVER_PRODUCT_ID	0x0004  // Shasta
+#define DRIVER_BCD_DEVICE	0x0100  // FW version 01.00
+
+#define DRIVER_MFG_STR		"Amazon"
+#define DRIVER_VENDOR_ID_STR	"Kindle"
+#define DRIVER_PROD_ID_STR	"Internal Storage"
+static const char productname[] = "Amazon Kindle";
+
+#else
+
 #define DRIVER_VENDOR_ID	0x0525	// NetChip
 #define DRIVER_PRODUCT_ID	0xa4a5	// Linux-USB File-backed Storage Gadget
+
+#endif
+
+static int recovery_mode = 0;
+#ifdef MODULE
+module_param_named(recovery_mode, recovery_mode, int, S_IRUGO);
+MODULE_PARM_DESC(recovery_mode, "recovery util mode");
+#endif
 
 
 /*
@@ -331,11 +337,17 @@ MODULE_LICENSE("Dual BSD/GPL");
 	dev_vdbg(&(d)->gadget->dev , fmt , ## args)
 #define ERROR(d, fmt, args...) \
 	dev_err(&(d)->gadget->dev , fmt , ## args)
-#define WARNING(d, fmt, args...) \
-	dev_warn(&(d)->gadget->dev , fmt , ## args)
 #define INFO(d, fmt, args...) \
 	dev_info(&(d)->gadget->dev , fmt , ## args)
 
+#if defined(CONFIG_MACH_MX50_YOSHI)
+#define ICHRG_VALUE_HIGH	5	/* As defined by Atlas - maps to 480mA */
+#define ICHRG_VALUE_FULL	1	/* maps to 80mA */
+#endif
+
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+#define FSG_THREAD_NICE_LEVEL	(-20)
+#endif
 
 /*-------------------------------------------------------------------------*/
 
@@ -352,7 +364,6 @@ static struct {
 
 	int		removable;
 	int		can_stall;
-	int		cdrom;
 
 	char		*transport_parm;
 	char		*protocol_parm;
@@ -369,12 +380,19 @@ static struct {
 } mod_data = {					// Default values
 	.transport_parm		= "BBB",
 	.protocol_parm		= "SCSI",
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+	.removable		= 1,
+#else
 	.removable		= 0,
+#endif
 	.can_stall		= 1,
-	.cdrom			= 0,
 	.vendor			= DRIVER_VENDOR_ID,
 	.product		= DRIVER_PRODUCT_ID,
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+	.release		= DRIVER_BCD_DEVICE,
+#else
 	.release		= 0xffff,	// Use controller chip type
+#endif
 	.buflen			= 16384,
 	};
 
@@ -394,9 +412,6 @@ MODULE_PARM_DESC(removable, "true to simulate removable media");
 
 module_param_named(stall, mod_data.can_stall, bool, S_IRUGO);
 MODULE_PARM_DESC(stall, "false to prevent bulk stalls");
-
-module_param_named(cdrom, mod_data.cdrom, bool, S_IRUGO);
-MODULE_PARM_DESC(cdrom, "true to emulate cdrom instead of disk");
 
 
 /* In the non-TEST version, only the module parameters listed above
@@ -426,10 +441,6 @@ MODULE_PARM_DESC(buflen, "I/O buffer size");
 
 
 /*-------------------------------------------------------------------------*/
-
-/* SCSI device types */
-#define TYPE_DISK	0x00
-#define TYPE_CDROM	0x05
 
 /* USB protocol value = the transport method */
 #define USB_PR_CBI	0x00		// Control/Bulk/Interrupt
@@ -507,8 +518,6 @@ struct interrupt_data {
 #define SC_READ_12			0xa8
 #define SC_READ_CAPACITY		0x25
 #define SC_READ_FORMAT_CAPACITIES	0x23
-#define SC_READ_HEADER			0x44
-#define SC_READ_TOC			0x43
 #define SC_RELEASE			0x17
 #define SC_REQUEST_SENSE		0x03
 #define SC_RESERVE			0x16
@@ -680,6 +689,7 @@ struct fsg_dev {
 #define REGISTERED		0
 #define IGNORE_BULK_OUT		1
 #define SUSPENDED		2
+#define ONLINE			3
 
 	struct usb_ep		*bulk_in;
 	struct usb_ep		*bulk_out;
@@ -714,6 +724,14 @@ struct fsg_dev {
 	unsigned int		nluns;
 	struct lun		*luns;
 	struct lun		*curlun;
+
+#define SC_KEEPALIVE_DELAY	2000 /* 2 secs */
+	int			ms_keepalive;
+	struct delayed_work	synchronize_cache_work;
+
+	struct tasklet_struct	susp_task;
+	struct tasklet_struct	resm_task;
+
 };
 
 typedef void (*fsg_routine_t)(struct fsg_dev *);
@@ -734,12 +752,15 @@ static void set_bulk_out_req_length(struct fsg_dev *fsg,
 	if (rem > 0)
 		length += fsg->bulk_out_maxpacket - rem;
 	bh->outreq->length = length;
+	if (bh->bulk_out_intended_length == 31)
+		bh->outreq->length = 31;
 }
 
 static struct fsg_dev			*the_fsg;
 static struct usb_gadget_driver		fsg_driver;
 
 static void	close_backing_file(struct lun *curlun);
+static void	close_all_backing_files(struct fsg_dev *fsg);
 
 
 /*-------------------------------------------------------------------------*/
@@ -801,9 +822,29 @@ static int fsg_set_halt(struct fsg_dev *fsg, struct usb_ep *ep)
 
 /* Routines for unaligned data access */
 
-static u32 get_unaligned_be24(u8 *buf)
+static u16 get_be16(u8 *buf)
 {
-	return 0xffffff & (u32) get_unaligned_be32(buf - 1);
+	return ((u16) buf[0] << 8) | ((u16) buf[1]);
+}
+
+static u32 get_be32(u8 *buf)
+{
+	return ((u32) buf[0] << 24) | ((u32) buf[1] << 16) |
+			((u32) buf[2] << 8) | ((u32) buf[3]);
+}
+
+static void put_be16(u8 *buf, u16 val)
+{
+	buf[0] = val >> 8;
+	buf[1] = val;
+}
+
+static void put_be32(u8 *buf, u32 val)
+{
+	buf[0] = val >> 24;
+	buf[1] = val >> 16;
+	buf[2] = val >> 8;
+	buf[3] = val & 0xff;
 }
 
 
@@ -828,13 +869,17 @@ device_desc = {
 	.bLength =		sizeof device_desc,
 	.bDescriptorType =	USB_DT_DEVICE,
 
-	.bcdUSB =		cpu_to_le16(0x0200),
+	.bcdUSB =		__constant_cpu_to_le16(0x0200),
 	.bDeviceClass =		USB_CLASS_PER_INTERFACE,
 
 	/* The next three values can be overridden by module parameters */
-	.idVendor =		cpu_to_le16(DRIVER_VENDOR_ID),
-	.idProduct =		cpu_to_le16(DRIVER_PRODUCT_ID),
-	.bcdDevice =		cpu_to_le16(0xffff),
+	.idVendor =		__constant_cpu_to_le16(DRIVER_VENDOR_ID),
+	.idProduct =		__constant_cpu_to_le16(DRIVER_PRODUCT_ID),
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+	.bcdDevice =		__constant_cpu_to_le16(DRIVER_BCD_DEVICE),
+#else
+	.bcdDevice =		__constant_cpu_to_le16(0xffff),
+#endif
 
 	.iManufacturer =	STRING_MANUFACTURER,
 	.iProduct =		STRING_PRODUCT,
@@ -852,7 +897,7 @@ config_desc = {
 	.bConfigurationValue =	CONFIG_VALUE,
 	.iConfiguration =	STRING_CONFIG,
 	.bmAttributes =		USB_CONFIG_ATT_ONE | USB_CONFIG_ATT_SELFPOWER,
-	.bMaxPower =		CONFIG_USB_GADGET_VBUS_DRAW / 2,
+        .bMaxPower =            CONFIG_USB_GADGET_VBUS_DRAW / 2, 
 };
 
 static struct usb_otg_descriptor
@@ -907,7 +952,7 @@ fs_intr_in_desc = {
 
 	.bEndpointAddress =	USB_DIR_IN,
 	.bmAttributes =		USB_ENDPOINT_XFER_INT,
-	.wMaxPacketSize =	cpu_to_le16(2),
+	.wMaxPacketSize =	__constant_cpu_to_le16(2),
 	.bInterval =		32,	// frames -> 32 ms
 };
 
@@ -935,7 +980,7 @@ dev_qualifier = {
 	.bLength =		sizeof dev_qualifier,
 	.bDescriptorType =	USB_DT_DEVICE_QUALIFIER,
 
-	.bcdUSB =		cpu_to_le16(0x0200),
+	.bcdUSB =		__constant_cpu_to_le16(0x0200),
 	.bDeviceClass =		USB_CLASS_PER_INTERFACE,
 
 	.bNumConfigurations =	1,
@@ -948,7 +993,7 @@ hs_bulk_in_desc = {
 
 	/* bEndpointAddress copied from fs_bulk_in_desc during fsg_bind() */
 	.bmAttributes =		USB_ENDPOINT_XFER_BULK,
-	.wMaxPacketSize =	cpu_to_le16(512),
+	.wMaxPacketSize =	__constant_cpu_to_le16(512),
 };
 
 static struct usb_endpoint_descriptor
@@ -958,7 +1003,7 @@ hs_bulk_out_desc = {
 
 	/* bEndpointAddress copied from fs_bulk_out_desc during fsg_bind() */
 	.bmAttributes =		USB_ENDPOINT_XFER_BULK,
-	.wMaxPacketSize =	cpu_to_le16(512),
+	.wMaxPacketSize =	__constant_cpu_to_le16(512),
 	.bInterval =		1,	// NAK every 1 uframe
 };
 
@@ -969,7 +1014,7 @@ hs_intr_in_desc = {
 
 	/* bEndpointAddress copied from fs_intr_in_desc during fsg_bind() */
 	.bmAttributes =		USB_ENDPOINT_XFER_INT,
-	.wMaxPacketSize =	cpu_to_le16(2),
+	.wMaxPacketSize =	__constant_cpu_to_le16(2),
 	.bInterval =		9,	// 2**(9-1) = 256 uframes -> 32 ms
 };
 
@@ -997,14 +1042,26 @@ ep_desc(struct usb_gadget *g, struct usb_endpoint_descriptor *fs,
 /* The CBI specification limits the serial string to 12 uppercase hexadecimal
  * characters. */
 static char				manufacturer[64];
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+static char				serial[17];
+#else
 static char				serial[13];
+#endif
 
 /* Static strings, in UTF-8 (for simplicity we use only ASCII characters) */
 static struct usb_string		strings[] = {
 	{STRING_MANUFACTURER,	manufacturer},
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+	{STRING_PRODUCT,	productname},
+#else
 	{STRING_PRODUCT,	longname},
+#endif
 	{STRING_SERIAL,		serial},
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+	{STRING_CONFIG,		"Bus-powered"},
+#else
 	{STRING_CONFIG,		"Self-powered"},
+#endif
 	{STRING_INTERFACE,	"Mass Storage"},
 	{}
 };
@@ -1104,7 +1161,7 @@ static int ep0_queue(struct fsg_dev *fsg)
 	if (rc != 0 && rc != -ESHUTDOWN) {
 
 		/* We can't do much more than wait for a reset */
-		WARNING(fsg, "error in submission: %s --> %d\n",
+		WARN(fsg, "error in submission: %s --> %d\n",
 				fsg->ep0->name, rc);
 	}
 	return rc;
@@ -1240,7 +1297,7 @@ static void received_cbi_adsc(struct fsg_dev *fsg, struct fsg_buffhd *bh)
 
 	/* Save the command for later */
 	if (fsg->cbbuf_cmnd_size)
-		WARNING(fsg, "CB[I] overwriting previous command\n");
+		WARN(fsg, "CB[I] overwriting previous command\n");
 	fsg->cbbuf_cmnd_size = req->actual;
 	memcpy(fsg->cbbuf_cmnd, req->buf, fsg->cbbuf_cmnd_size);
 
@@ -1405,6 +1462,14 @@ get_config:
 			 * state (queued bufs, etc) and set the new config. */
 			raise_exception(fsg, FSG_STATE_CONFIG_CHANGE);
 			value = DELAYED_STATUS;
+#if defined(CONFIG_MACH_MX50_YOSHI)
+			if (w_value) {
+				if (fsg->gadget->speed == USB_SPEED_HIGH)
+					usb_gadget_vbus_draw(fsg->gadget, ICHRG_VALUE_HIGH);
+				else
+					usb_gadget_vbus_draw(fsg->gadget, ICHRG_VALUE_FULL);
+			}
+#endif
 		}
 		break;
 	case USB_REQ_GET_CONFIGURATION:
@@ -1519,7 +1584,7 @@ static void start_transfer(struct fsg_dev *fsg, struct usb_ep *ep,
 		 * submissions if DMA is enabled. */
 		if (rc != -ESHUTDOWN && !(rc == -EOPNOTSUPP &&
 						req->length == 0))
-			WARNING(fsg, "error in submission: %s --> %d\n",
+			WARN(fsg, "error in submission: %s --> %d\n",
 					ep->name, rc);
 	}
 }
@@ -1564,9 +1629,9 @@ static int do_read(struct fsg_dev *fsg)
 	/* Get the starting Logical Block Address and check that it's
 	 * not too big */
 	if (fsg->cmnd[0] == SC_READ_6)
-		lba = get_unaligned_be24(&fsg->cmnd[1]);
+		lba = (fsg->cmnd[1] << 16) | get_be16(&fsg->cmnd[2]);
 	else {
-		lba = get_unaligned_be32(&fsg->cmnd[2]);
+		lba = get_be32(&fsg->cmnd[2]);
 
 		/* We allow DPO (Disable Page Out = don't save data in the
 		 * cache) and FUA (Force Unit Access = don't read from the
@@ -1693,15 +1758,17 @@ static int do_write(struct fsg_dev *fsg)
 		return -EINVAL;
 	}
 	spin_lock(&curlun->filp->f_lock);
-	curlun->filp->f_flags &= ~O_SYNC;	// Default is not to wait
+	/* Debug for CEL-1762 - default to O_SYNC due to poor Hynix write performance */
+	curlun->filp->f_flags |= O_SYNC;
+	//curlun->filp->f_flags &= ~O_SYNC;	// Default is not to wait
 	spin_unlock(&curlun->filp->f_lock);
 
 	/* Get the starting Logical Block Address and check that it's
 	 * not too big */
 	if (fsg->cmnd[0] == SC_WRITE_6)
-		lba = get_unaligned_be24(&fsg->cmnd[1]);
+		lba = (fsg->cmnd[1] << 16) | get_be16(&fsg->cmnd[2]);
 	else {
-		lba = get_unaligned_be32(&fsg->cmnd[2]);
+		lba = get_be32(&fsg->cmnd[2]);
 
 		/* We allow DPO (Disable Page Out = don't save data in the
 		 * cache) and FUA (Force Unit Access = write directly to the
@@ -1869,10 +1936,31 @@ static int do_write(struct fsg_dev *fsg)
 static int fsync_sub(struct lun *curlun)
 {
 	struct file	*filp = curlun->filp;
+	struct inode	*inode;
+	int		rc, err;
 
 	if (curlun->ro || !filp)
 		return 0;
-	return vfs_fsync(filp, filp->f_path.dentry, 1);
+	if (!filp->f_op || !filp->f_op->fsync)
+		return -EINVAL;
+
+	inode = filp->f_path.dentry->d_inode;
+	mutex_lock(&inode->i_mutex);
+	rc = filemap_fdatawrite(inode->i_mapping);
+	if ((filp->f_path.dentry == NULL) ) {
+		mutex_unlock(&inode->i_mutex);
+		return -EINVAL;
+	}
+
+	err = filp->f_op->fsync(filp, filp->f_path.dentry, 1);
+	if (!rc)
+		rc = err;
+	err = filemap_fdatawait(inode->i_mapping);
+	if (!rc)
+		rc = err;
+	mutex_unlock(&inode->i_mutex);
+	VLDBG(curlun, "fdatasync -> %d\n", rc);
+	return rc;
 }
 
 static void fsync_all(struct fsg_dev *fsg)
@@ -1881,6 +1969,37 @@ static void fsync_all(struct fsg_dev *fsg)
 
 	for (i = 0; i < fsg->nluns; ++i)
 		fsync_sub(&fsg->luns[i]);
+}
+
+static void do_synchronize_cache_work(struct work_struct *work)
+{
+	struct fsg_dev *fsg = 
+		container_of(work, struct fsg_dev, synchronize_cache_work.work);
+	struct lun	*curlun = fsg->curlun;
+
+	/* If the host is still pinging us, don't unload */
+	if (fsg->ms_keepalive) {
+	    DBG(fsg, "Device still alive: not stopping\n");
+	    return;
+	}
+
+	DBG(fsg, "Device stopping after SYNCHRONIZE_CACHE..\n");
+
+	/* Shut down the backing file */
+	down_write(&fsg->filesem);
+	close_backing_file(curlun);
+	up_write(&fsg->filesem);
+			
+	/* Send event to userspace */
+	if (!recovery_mode &&
+	    test_and_clear_bit(ONLINE, &fsg->atomic_bitflags) &&
+	    kobject_uevent_atomic(&fsg->gadget->dev.parent->kobj, KOBJ_OFFLINE)) {
+	    printk(KERN_ERR __FILE__ ", line %d: kobject_uevent_atomic failed\n", __LINE__);
+	}
+
+	set_drivemode_online(0);
+
+	DBG(fsg, "..complete\n");
 }
 
 static int do_synchronize_cache(struct fsg_dev *fsg)
@@ -1893,6 +2012,15 @@ static int do_synchronize_cache(struct fsg_dev *fsg)
 	rc = fsync_sub(curlun);
 	if (rc)
 		curlun->sense_data = SS_WRITE_ERROR;
+	
+	cancel_delayed_work(&fsg->synchronize_cache_work);
+
+	/* Check to see if Windows is still there */
+	if (fsg->ms_keepalive) {
+	    fsg->ms_keepalive = 0;
+	    schedule_delayed_work(&fsg->synchronize_cache_work, msecs_to_jiffies(SC_KEEPALIVE_DELAY));
+	}
+
 	return 0;
 }
 
@@ -1922,7 +2050,7 @@ static int do_verify(struct fsg_dev *fsg)
 
 	/* Get the starting Logical Block Address and check that it's
 	 * not too big */
-	lba = get_unaligned_be32(&fsg->cmnd[2]);
+	lba = get_be32(&fsg->cmnd[2]);
 	if (lba >= curlun->num_sectors) {
 		curlun->sense_data = SS_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE;
 		return -EINVAL;
@@ -1935,7 +2063,7 @@ static int do_verify(struct fsg_dev *fsg)
 		return -EINVAL;
 	}
 
-	verification_length = get_unaligned_be16(&fsg->cmnd[7]);
+	verification_length = get_be16(&fsg->cmnd[7]);
 	if (unlikely(verification_length == 0))
 		return -EIO;		// No default reply
 
@@ -2011,29 +2139,29 @@ static int do_inquiry(struct fsg_dev *fsg, struct fsg_buffhd *bh)
 {
 	u8	*buf = (u8 *) bh->buf;
 
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+	static char vendor_id[] = DRIVER_VENDOR_ID_STR;
+	static char product_id[] = DRIVER_PROD_ID_STR;
+#else
 	static char vendor_id[] = "Linux   ";
-	static char product_disk_id[] = "File-Stor Gadget";
-	static char product_cdrom_id[] = "File-CD Gadget  ";
+	static char product_id[] = "File-Stor Gadget";
+#endif
 
 	if (!fsg->curlun) {		// Unsupported LUNs are okay
 		fsg->bad_lun_okay = 1;
 		memset(buf, 0, 36);
 		buf[0] = 0x7f;		// Unsupported, no device-type
-		buf[4] = 31;		// Additional length
 		return 36;
 	}
 
-	memset(buf, 0, 8);
-	buf[0] = (mod_data.cdrom ? TYPE_CDROM : TYPE_DISK);
+	memset(buf, 0, 8);	// Non-removable, direct-access device
 	if (mod_data.removable)
 		buf[1] = 0x80;
 	buf[2] = 2;		// ANSI SCSI level 2
 	buf[3] = 2;		// SCSI-2 INQUIRY data format
 	buf[4] = 31;		// Additional length
 				// No special options
-	sprintf(buf + 8, "%-8s%-16s%04x", vendor_id,
-			(mod_data.cdrom ? product_cdrom_id :
-				product_disk_id),
+	sprintf(buf + 8, "%-8s%-16s%04x", vendor_id, product_id,
 			mod_data.release);
 	return 36;
 }
@@ -2085,7 +2213,7 @@ static int do_request_sense(struct fsg_dev *fsg, struct fsg_buffhd *bh)
 	memset(buf, 0, 18);
 	buf[0] = valid | 0x70;			// Valid, current error
 	buf[2] = SK(sd);
-	put_unaligned_be32(sdinfo, &buf[3]);	/* Sense information */
+	put_be32(&buf[3], sdinfo);		// Sense information
 	buf[7] = 18 - 8;			// Additional sense length
 	buf[12] = ASC(sd);
 	buf[13] = ASCQ(sd);
@@ -2096,7 +2224,7 @@ static int do_request_sense(struct fsg_dev *fsg, struct fsg_buffhd *bh)
 static int do_read_capacity(struct fsg_dev *fsg, struct fsg_buffhd *bh)
 {
 	struct lun	*curlun = fsg->curlun;
-	u32		lba = get_unaligned_be32(&fsg->cmnd[2]);
+	u32		lba = get_be32(&fsg->cmnd[2]);
 	int		pmi = fsg->cmnd[8];
 	u8		*buf = (u8 *) bh->buf;
 
@@ -2106,79 +2234,9 @@ static int do_read_capacity(struct fsg_dev *fsg, struct fsg_buffhd *bh)
 		return -EINVAL;
 	}
 
-	put_unaligned_be32(curlun->num_sectors - 1, &buf[0]);
-						/* Max logical block */
-	put_unaligned_be32(512, &buf[4]);	/* Block length */
+	put_be32(&buf[0], curlun->num_sectors - 1);	// Max logical block
+	put_be32(&buf[4], 512);				// Block length
 	return 8;
-}
-
-
-static void store_cdrom_address(u8 *dest, int msf, u32 addr)
-{
-	if (msf) {
-		/* Convert to Minutes-Seconds-Frames */
-		addr >>= 2;		/* Convert to 2048-byte frames */
-		addr += 2*75;		/* Lead-in occupies 2 seconds */
-		dest[3] = addr % 75;	/* Frames */
-		addr /= 75;
-		dest[2] = addr % 60;	/* Seconds */
-		addr /= 60;
-		dest[1] = addr;		/* Minutes */
-		dest[0] = 0;		/* Reserved */
-	} else {
-		/* Absolute sector */
-		put_unaligned_be32(addr, dest);
-	}
-}
-
-static int do_read_header(struct fsg_dev *fsg, struct fsg_buffhd *bh)
-{
-	struct lun	*curlun = fsg->curlun;
-	int		msf = fsg->cmnd[1] & 0x02;
-	u32		lba = get_unaligned_be32(&fsg->cmnd[2]);
-	u8		*buf = (u8 *) bh->buf;
-
-	if ((fsg->cmnd[1] & ~0x02) != 0) {		/* Mask away MSF */
-		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
-		return -EINVAL;
-	}
-	if (lba >= curlun->num_sectors) {
-		curlun->sense_data = SS_LOGICAL_BLOCK_ADDRESS_OUT_OF_RANGE;
-		return -EINVAL;
-	}
-
-	memset(buf, 0, 8);
-	buf[0] = 0x01;		/* 2048 bytes of user data, rest is EC */
-	store_cdrom_address(&buf[4], msf, lba);
-	return 8;
-}
-
-
-static int do_read_toc(struct fsg_dev *fsg, struct fsg_buffhd *bh)
-{
-	struct lun	*curlun = fsg->curlun;
-	int		msf = fsg->cmnd[1] & 0x02;
-	int		start_track = fsg->cmnd[6];
-	u8		*buf = (u8 *) bh->buf;
-
-	if ((fsg->cmnd[1] & ~0x02) != 0 ||		/* Mask away MSF */
-			start_track > 1) {
-		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
-		return -EINVAL;
-	}
-
-	memset(buf, 0, 20);
-	buf[1] = (20-2);		/* TOC data length */
-	buf[2] = 1;			/* First track number */
-	buf[3] = 1;			/* Last track number */
-	buf[5] = 0x16;			/* Data track, copying allowed */
-	buf[6] = 0x01;			/* Only track is number 1 */
-	store_cdrom_address(&buf[8], msf, 0);
-
-	buf[13] = 0x16;			/* Lead-out track is data */
-	buf[14] = 0xAA;			/* Lead-out track number */
-	store_cdrom_address(&buf[16], msf, curlun->num_sectors);
-	return 20;
 }
 
 
@@ -2235,13 +2293,10 @@ static int do_mode_sense(struct fsg_dev *fsg, struct fsg_buffhd *bh)
 			buf[2] = 0x04;	// Write cache enable,
 					// Read cache not disabled
 					// No cache retention priorities
-			put_unaligned_be16(0xffff, &buf[4]);
-					/* Don't disable prefetch */
-					/* Minimum prefetch = 0 */
-			put_unaligned_be16(0xffff, &buf[8]);
-					/* Maximum prefetch */
-			put_unaligned_be16(0xffff, &buf[10]);
-					/* Maximum prefetch ceiling */
+			put_be16(&buf[4], 0xffff);  // Don't disable prefetch
+					// Minimum prefetch = 0
+			put_be16(&buf[8], 0xffff);  // Maximum prefetch
+			put_be16(&buf[10], 0xffff); // Maximum prefetch ceiling
 		}
 		buf += 12;
 	}
@@ -2258,7 +2313,7 @@ static int do_mode_sense(struct fsg_dev *fsg, struct fsg_buffhd *bh)
 	if (mscmnd == SC_MODE_SENSE_6)
 		buf0[0] = len - 1;
 	else
-		put_unaligned_be16(len - 2, buf0);
+		put_be16(buf0, len - 2);
 	return len;
 }
 
@@ -2285,7 +2340,6 @@ static int do_start_stop(struct fsg_dev *fsg)
 	}
 
 	if (!start) {
-
 		/* Are we allowed to unload the media? */
 		if (curlun->prevent_medium_removal) {
 			LDBG(curlun, "unload attempt prevented\n");
@@ -2293,13 +2347,34 @@ static int do_start_stop(struct fsg_dev *fsg)
 			return -EINVAL;
 		}
 		if (loej) {		// Simulate an unload/eject
+
+			cancel_delayed_work(&fsg->synchronize_cache_work);
+
 			up_read(&fsg->filesem);
 			down_write(&fsg->filesem);
 			close_backing_file(curlun);
 			up_write(&fsg->filesem);
 			down_read(&fsg->filesem);
+			
+			if (!recovery_mode &&
+				test_and_clear_bit(ONLINE, &fsg->atomic_bitflags) &&
+				kobject_uevent_atomic(&fsg->gadget->dev.parent->kobj, KOBJ_OFFLINE)) {
+					printk(KERN_ERR __FILE__ ", line %d: kobject_uevent_atomic failed\n", __LINE__);
+			}
+			else {
+				fsg->gadget->configured = 1;
+			}
 		}
 	} else {
+
+		if (!recovery_mode &&
+			!test_and_set_bit(ONLINE, &fsg->atomic_bitflags) &&
+			kobject_uevent_atomic(&fsg->gadget->dev.parent->kobj, KOBJ_ONLINE)) {
+				printk(KERN_ERR __FILE__ ", line %d: kobject_uevent_atomic failed\n", __LINE__);
+		}
+		else {
+			fsg->gadget->configured = 1;
+		}
 
 		/* Our emulation doesn't support mounting; the medium is
 		 * available for use as soon as it is loaded. */
@@ -2308,6 +2383,7 @@ static int do_start_stop(struct fsg_dev *fsg)
 			return -EINVAL;
 		}
 	}
+	set_drivemode_online(test_bit(ONLINE, &fsg->atomic_bitflags));
 #endif
 	return 0;
 }
@@ -2324,6 +2400,8 @@ static int do_prevent_allow(struct fsg_dev *fsg)
 	}
 
 	prevent = fsg->cmnd[4] & 0x01;
+	DBG(fsg, "prevent=%d\n", prevent);
+
 	if ((fsg->cmnd[4] & ~0x01) != 0) {		// Mask away Prevent
 		curlun->sense_data = SS_INVALID_FIELD_IN_CDB;
 		return -EINVAL;
@@ -2346,10 +2424,9 @@ static int do_read_format_capacities(struct fsg_dev *fsg,
 	buf[3] = 8;		// Only the Current/Maximum Capacity Descriptor
 	buf += 4;
 
-	put_unaligned_be32(curlun->num_sectors, &buf[0]);
-						/* Number of blocks */
-	put_unaligned_be32(512, &buf[4]);	/* Block length */
-	buf[4] = 0x02;				/* Current capacity */
+	put_be32(&buf[0], curlun->num_sectors);		// Number of blocks
+	put_be32(&buf[4], 512);				// Block length
+	buf[4] = 0x02;					// Current capacity
 	return 12;
 }
 
@@ -2375,7 +2452,7 @@ static int halt_bulk_in_endpoint(struct fsg_dev *fsg)
 		VDBG(fsg, "delayed bulk-in endpoint halt\n");
 	while (rc != 0) {
 		if (rc != -EAGAIN) {
-			WARNING(fsg, "usb_ep_set_halt -> %d\n", rc);
+			WARN(fsg, "usb_ep_set_halt -> %d\n", rc);
 			rc = 0;
 			break;
 		}
@@ -2398,7 +2475,7 @@ static int wedge_bulk_in_endpoint(struct fsg_dev *fsg)
 		VDBG(fsg, "delayed bulk-in endpoint wedge\n");
 	while (rc != 0) {
 		if (rc != -EAGAIN) {
-			WARNING(fsg, "usb_ep_set_wedge -> %d\n", rc);
+			WARN(fsg, "usb_ep_set_wedge -> %d\n", rc);
 			rc = 0;
 			break;
 		}
@@ -2637,7 +2714,7 @@ static int send_status(struct fsg_dev *fsg)
 		struct bulk_cs_wrap	*csw = bh->buf;
 
 		/* Store and send the Bulk-only CSW */
-		csw->Signature = cpu_to_le32(USB_BULK_CS_SIG);
+		csw->Signature = __constant_cpu_to_le32(USB_BULK_CS_SIG);
 		csw->Tag = fsg->tag;
 		csw->Residue = cpu_to_le32(fsg->residue);
 		csw->Status = status;
@@ -2848,6 +2925,7 @@ static int do_scsi_command(struct fsg_dev *fsg)
 	}
 	fsg->phase_error = 0;
 	fsg->short_packet_received = 0;
+	fsg->ms_keepalive = 1;
 
 	down_read(&fsg->filesem);	// We're using the backing file
 	switch (fsg->cmnd[0]) {
@@ -2869,7 +2947,7 @@ static int do_scsi_command(struct fsg_dev *fsg)
 		break;
 
 	case SC_MODE_SELECT_10:
-		fsg->data_size_from_cmnd = get_unaligned_be16(&fsg->cmnd[7]);
+		fsg->data_size_from_cmnd = get_be16(&fsg->cmnd[7]);
 		if ((reply = check_command(fsg, 10, DATA_DIR_FROM_HOST,
 				(1<<1) | (3<<7), 0,
 				"MODE SELECT(10)")) == 0)
@@ -2885,7 +2963,7 @@ static int do_scsi_command(struct fsg_dev *fsg)
 		break;
 
 	case SC_MODE_SENSE_10:
-		fsg->data_size_from_cmnd = get_unaligned_be16(&fsg->cmnd[7]);
+		fsg->data_size_from_cmnd = get_be16(&fsg->cmnd[7]);
 		if ((reply = check_command(fsg, 10, DATA_DIR_TO_HOST,
 				(1<<1) | (1<<2) | (3<<7), 0,
 				"MODE SENSE(10)")) == 0)
@@ -2910,8 +2988,7 @@ static int do_scsi_command(struct fsg_dev *fsg)
 		break;
 
 	case SC_READ_10:
-		fsg->data_size_from_cmnd =
-				get_unaligned_be16(&fsg->cmnd[7]) << 9;
+		fsg->data_size_from_cmnd = get_be16(&fsg->cmnd[7]) << 9;
 		if ((reply = check_command(fsg, 10, DATA_DIR_TO_HOST,
 				(1<<1) | (0xf<<2) | (3<<7), 1,
 				"READ(10)")) == 0)
@@ -2919,8 +2996,7 @@ static int do_scsi_command(struct fsg_dev *fsg)
 		break;
 
 	case SC_READ_12:
-		fsg->data_size_from_cmnd =
-				get_unaligned_be32(&fsg->cmnd[6]) << 9;
+		fsg->data_size_from_cmnd = get_be32(&fsg->cmnd[6]) << 9;
 		if ((reply = check_command(fsg, 12, DATA_DIR_TO_HOST,
 				(1<<1) | (0xf<<2) | (0xf<<6), 1,
 				"READ(12)")) == 0)
@@ -2935,28 +3011,8 @@ static int do_scsi_command(struct fsg_dev *fsg)
 			reply = do_read_capacity(fsg, bh);
 		break;
 
-	case SC_READ_HEADER:
-		if (!mod_data.cdrom)
-			goto unknown_cmnd;
-		fsg->data_size_from_cmnd = get_unaligned_be16(&fsg->cmnd[7]);
-		if ((reply = check_command(fsg, 10, DATA_DIR_TO_HOST,
-				(3<<7) | (0x1f<<1), 1,
-				"READ HEADER")) == 0)
-			reply = do_read_header(fsg, bh);
-		break;
-
-	case SC_READ_TOC:
-		if (!mod_data.cdrom)
-			goto unknown_cmnd;
-		fsg->data_size_from_cmnd = get_unaligned_be16(&fsg->cmnd[7]);
-		if ((reply = check_command(fsg, 10, DATA_DIR_TO_HOST,
-				(7<<6) | (1<<1), 1,
-				"READ TOC")) == 0)
-			reply = do_read_toc(fsg, bh);
-		break;
-
 	case SC_READ_FORMAT_CAPACITIES:
-		fsg->data_size_from_cmnd = get_unaligned_be16(&fsg->cmnd[7]);
+		fsg->data_size_from_cmnd = get_be16(&fsg->cmnd[7]);
 		if ((reply = check_command(fsg, 10, DATA_DIR_TO_HOST,
 				(3<<7), 1,
 				"READ FORMAT CAPACITIES")) == 0)
@@ -3014,8 +3070,7 @@ static int do_scsi_command(struct fsg_dev *fsg)
 		break;
 
 	case SC_WRITE_10:
-		fsg->data_size_from_cmnd =
-				get_unaligned_be16(&fsg->cmnd[7]) << 9;
+		fsg->data_size_from_cmnd = get_be16(&fsg->cmnd[7]) << 9;
 		if ((reply = check_command(fsg, 10, DATA_DIR_FROM_HOST,
 				(1<<1) | (0xf<<2) | (3<<7), 1,
 				"WRITE(10)")) == 0)
@@ -3023,8 +3078,7 @@ static int do_scsi_command(struct fsg_dev *fsg)
 		break;
 
 	case SC_WRITE_12:
-		fsg->data_size_from_cmnd =
-				get_unaligned_be32(&fsg->cmnd[6]) << 9;
+		fsg->data_size_from_cmnd = get_be32(&fsg->cmnd[6]) << 9;
 		if ((reply = check_command(fsg, 12, DATA_DIR_FROM_HOST,
 				(1<<1) | (0xf<<2) | (0xf<<6), 1,
 				"WRITE(12)")) == 0)
@@ -3042,7 +3096,6 @@ static int do_scsi_command(struct fsg_dev *fsg)
 		// Fall through
 
 	default:
- unknown_cmnd:
 		fsg->data_size_from_cmnd = 0;
 		sprintf(unknown, "Unknown x%02x", fsg->cmnd[0]);
 		if ((reply = check_command(fsg, fsg->cmnd_size,
@@ -3084,7 +3137,7 @@ static int received_cbw(struct fsg_dev *fsg, struct fsg_buffhd *bh)
 
 	/* Is the CBW valid? */
 	if (req->actual != USB_BULK_CB_WRAP_LEN ||
-			cbw->Signature != cpu_to_le32(
+			cbw->Signature != __constant_cpu_to_le32(
 				USB_BULK_CB_SIG)) {
 		DBG(fsg, "invalid CBW: len %u sig 0x%x\n",
 				req->actual,
@@ -3320,7 +3373,6 @@ reset:
 	return rc;
 }
 
-
 /*
  * Change our operational configuration.  This code must agree with the code
  * that returns config descriptors, and with interface altsetting code.
@@ -3355,6 +3407,17 @@ static int do_set_config(struct fsg_dev *fsg, u8 new_config)
 			default: 		speed = "?";	break;
 			}
 			INFO(fsg, "%s speed config #%d\n", speed, fsg->config);
+
+			if (!recovery_mode &&
+				!test_and_set_bit(ONLINE, &fsg->atomic_bitflags) &&
+				kobject_uevent_atomic(&fsg->gadget->dev.parent->kobj, KOBJ_ONLINE)) {
+					printk(KERN_ERR __FILE__ ", line %d: kobject_uevent_atomic failed\n", __LINE__);			
+			}
+			else {
+				fsg->gadget->configured = 1;
+			}
+
+			set_drivemode_online(test_bit(ONLINE, &fsg->atomic_bitflags));
 		}
 	}
 	return rc;
@@ -3577,16 +3640,18 @@ static int fsg_main_thread(void *fsg_)
 		if (!exception_in_progress(fsg))
 			fsg->state = FSG_STATE_IDLE;
 		spin_unlock_irq(&fsg->lock);
-		}
+	}
 
 	spin_lock_irq(&fsg->lock);
 	fsg->thread_task = NULL;
 	spin_unlock_irq(&fsg->lock);
 
-	/* If we are exiting because of a signal, unregister the
-	 * gadget driver. */
-	if (test_and_clear_bit(REGISTERED, &fsg->atomic_bitflags))
+	/* In case we are exiting because of a signal, unregister the
+	 * gadget driver and close the backing file. */
+	if (test_and_clear_bit(REGISTERED, &fsg->atomic_bitflags)) {
 		usb_gadget_unregister_driver(&fsg_driver);
+		close_all_backing_files(fsg);
+	}
 
 	/* Let the unbind and cleanup routines know the thread has exited */
 	complete_and_exit(&fsg->thread_notifier, 0);
@@ -3606,7 +3671,6 @@ static int open_backing_file(struct lun *curlun, const char *filename)
 	struct inode			*inode = NULL;
 	loff_t				size;
 	loff_t				num_sectors;
-	loff_t				min_sectors;
 
 	/* R/W if we can, R/O if we must */
 	ro = curlun->ro;
@@ -3650,19 +3714,8 @@ static int open_backing_file(struct lun *curlun, const char *filename)
 		rc = (int) size;
 		goto out;
 	}
-	num_sectors = size >> 9;	// File size in 512-byte blocks
-	min_sectors = 1;
-	if (mod_data.cdrom) {
-		num_sectors &= ~3;	// Reduce to a multiple of 2048
-		min_sectors = 300*4;	// Smallest track is 300 frames
-		if (num_sectors >= 256*60*75*4) {
-			num_sectors = (256*60*75 - 1) * 4;
-			LINFO(curlun, "file too big: %s\n", filename);
-			LINFO(curlun, "using only first %d blocks\n",
-					(int) num_sectors);
-		}
-	}
-	if (num_sectors < min_sectors) {
+	num_sectors = size >> 9;	// File size in 512-byte sectors
+	if (num_sectors == 0) {
 		LINFO(curlun, "file too small: %s\n", filename);
 		rc = -ETOOSMALL;
 		goto out;
@@ -3689,6 +3742,14 @@ static void close_backing_file(struct lun *curlun)
 		fput(curlun->filp);
 		curlun->filp = NULL;
 	}
+}
+
+static void close_all_backing_files(struct fsg_dev *fsg)
+{
+	int	i;
+
+	for (i = 0; i < fsg->nluns; ++i)
+		close_backing_file(&fsg->luns[i]);
 }
 
 
@@ -3726,6 +3787,12 @@ static ssize_t show_file(struct device *dev, struct device_attribute *attr,
 	return rc;
 }
 
+static ssize_t
+show_online(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct fsg_dev *fsg = dev_get_drvdata(dev);
+	return sprintf(buf, "%d\n", test_bit(ONLINE, &fsg->atomic_bitflags));
+}
 
 static ssize_t store_ro(struct device *dev, struct device_attribute *attr,
 		const char *buf, size_t count)
@@ -3790,6 +3857,7 @@ static ssize_t store_file(struct device *dev, struct device_attribute *attr,
 /* The write permissions and store_xxx pointers are set in fsg_bind() */
 static DEVICE_ATTR(ro, 0444, show_ro, NULL);
 static DEVICE_ATTR(file, 0444, show_file, NULL);
+static DEVICE_ATTR(online, 0444, show_online, NULL);
 
 
 /*-------------------------------------------------------------------------*/
@@ -3819,16 +3887,26 @@ static void /* __init_or_exit */ fsg_unbind(struct usb_gadget *gadget)
 	DBG(fsg, "unbind\n");
 	clear_bit(REGISTERED, &fsg->atomic_bitflags);
 
+	cancel_delayed_work(&fsg->synchronize_cache_work);
+
 	/* Unregister the sysfs attribute files and the LUNs */
 	for (i = 0; i < fsg->nluns; ++i) {
 		curlun = &fsg->luns[i];
 		if (curlun->registered) {
 			device_remove_file(&curlun->dev, &dev_attr_ro);
 			device_remove_file(&curlun->dev, &dev_attr_file);
-			close_backing_file(curlun);
 			device_unregister(&curlun->dev);
 			curlun->registered = 0;
 		}
+	}
+
+	if (!recovery_mode &&
+		test_and_clear_bit(ONLINE, &fsg->atomic_bitflags) &&
+		kobject_uevent_atomic(&fsg->gadget->dev.parent->kobj, KOBJ_OFFLINE)) {
+			printk(KERN_ERR __FILE__ ", line %d: kobject_uevent_atomic failed\n", __LINE__);
+	}
+	else {
+		fsg->gadget->configured = 0;
 	}
 
 	/* If the thread isn't already dead, tell it to exit now */
@@ -3865,11 +3943,7 @@ static int __init check_parameters(struct fsg_dev *fsg)
 	mod_data.protocol_type = USB_SC_SCSI;
 	mod_data.protocol_name = "Transparent SCSI";
 
-	/* Some peripheral controllers are known not to be able to
-	 * halt bulk endpoints correctly.  If one of them is present,
-	 * disable stalls.
-	 */
-	if (gadget_is_sh(fsg->gadget) || gadget_is_at91(fsg->gadget))
+	if (gadget_is_sh(fsg->gadget))
 		mod_data.can_stall = 0;
 
 	if (mod_data.release == 0xffff) {	// Parameter wasn't set
@@ -3881,7 +3955,7 @@ static int __init check_parameters(struct fsg_dev *fsg)
 		if (gcnum >= 0)
 			mod_data.release = 0x0300 + gcnum;
 		else {
-			WARNING(fsg, "controller '%s' not recognized\n",
+			WARN(fsg, "controller '%s' not recognized\n",
 				fsg->gadget->name);
 			mod_data.release = 0x0399;
 		}
@@ -3962,12 +4036,9 @@ static int __init fsg_bind(struct usb_gadget *gadget)
 		goto out;
 
 	if (mod_data.removable) {	// Enable the store_xxx attributes
-		dev_attr_file.attr.mode = 0644;
+		dev_attr_ro.attr.mode = dev_attr_file.attr.mode = 0644;
+		dev_attr_ro.store = store_ro;
 		dev_attr_file.store = store_file;
-		if (!mod_data.cdrom) {
-			dev_attr_ro.attr.mode = 0644;
-			dev_attr_ro.store = store_ro;
-		}
 	}
 
 	/* Find out how many LUNs there should be */
@@ -3992,14 +4063,12 @@ static int __init fsg_bind(struct usb_gadget *gadget)
 	for (i = 0; i < fsg->nluns; ++i) {
 		curlun = &fsg->luns[i];
 		curlun->ro = mod_data.ro[i];
-		if (mod_data.cdrom)
-			curlun->ro = 1;
 		curlun->dev.release = lun_release;
 		curlun->dev.parent = &gadget->dev;
 		curlun->dev.driver = &fsg_driver.driver;
 		dev_set_drvdata(&curlun->dev, fsg);
 		dev_set_name(&curlun->dev,"%s-lun%d",
-			     dev_name(&gadget->dev), i);
+				dev_name(&gadget->dev), i);
 
 		if ((rc = device_register(&curlun->dev)) != 0) {
 			INFO(fsg, "failed to register LUN%d: %d\n", i, rc);
@@ -4008,7 +4077,9 @@ static int __init fsg_bind(struct usb_gadget *gadget)
 		if ((rc = device_create_file(&curlun->dev,
 					&dev_attr_ro)) != 0 ||
 				(rc = device_create_file(&curlun->dev,
-					&dev_attr_file)) != 0) {
+					&dev_attr_file)) != 0 ||
+				(rc = device_create_file(&curlun->dev,
+					&dev_attr_online)) != 0) {
 			device_unregister(&curlun->dev);
 			goto out;
 		}
@@ -4106,6 +4177,21 @@ static int __init fsg_bind(struct usb_gadget *gadget)
 	/* This should reflect the actual gadget power source */
 	usb_gadget_set_selfpowered(gadget);
 
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+	snprintf(manufacturer, sizeof manufacturer, DRIVER_MFG_STR);
+
+	{
+		char *src = mx50_serial_number;
+		char *dst = serial;
+
+		if (*src == 0)
+			src = "Empty";
+
+		strncpy(dst, src, sizeof(serial));
+		dst[sizeof(serial)-1] = 0;
+        }
+
+#else
 	snprintf(manufacturer, sizeof manufacturer, "%s %s with %s",
 			init_utsname()->sysname, init_utsname()->release,
 			gadget->name);
@@ -4119,6 +4205,7 @@ static int __init fsg_bind(struct usb_gadget *gadget)
 			break;
 		sprintf(&serial[i], "%02X", c);
 	}
+#endif
 
 	fsg->thread_task = kthread_create(fsg_main_thread, fsg,
 			"file-storage-gadget");
@@ -4126,6 +4213,10 @@ static int __init fsg_bind(struct usb_gadget *gadget)
 		rc = PTR_ERR(fsg->thread_task);
 		goto out;
 	}
+
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+	set_user_nice(fsg->thread_task, FSG_THREAD_NICE_LEVEL);
+#endif
 
 	INFO(fsg, DRIVER_DESC ", version: " DRIVER_VERSION "\n");
 	INFO(fsg, "Number of LUNs=%d\n", fsg->nluns);
@@ -4153,12 +4244,16 @@ static int __init fsg_bind(struct usb_gadget *gadget)
 			mod_data.protocol_name, mod_data.protocol_type);
 	DBG(fsg, "VendorID=x%04x, ProductID=x%04x, Release=x%04x\n",
 			mod_data.vendor, mod_data.product, mod_data.release);
-	DBG(fsg, "removable=%d, stall=%d, cdrom=%d, buflen=%u\n",
+	DBG(fsg, "removable=%d, stall=%d, buflen=%u\n",
 			mod_data.removable, mod_data.can_stall,
-			mod_data.cdrom, mod_data.buflen);
+			mod_data.buflen);
 	DBG(fsg, "I/O thread pid: %d\n", task_pid_nr(fsg->thread_task));
 
 	set_bit(REGISTERED, &fsg->atomic_bitflags);
+
+
+	fsg->ms_keepalive = 0;
+	INIT_DELAYED_WORK(&fsg->synchronize_cache_work, do_synchronize_cache_work);
 
 	/* Tell the thread to start working */
 	wake_up_process(fsg->thread_task);
@@ -4171,10 +4266,27 @@ autoconf_fail:
 out:
 	fsg->state = FSG_STATE_TERMINATED;	// The thread is dead
 	fsg_unbind(gadget);
+	close_all_backing_files(fsg);
 	complete(&fsg->thread_notifier);
 	return rc;
 }
 
+void suspend_tasklet(unsigned long arg) 
+{
+    struct fsg_dev *fsg = (struct fsg_dev *) arg;
+
+    if (kobject_uevent_atomic(&fsg->gadget->dev.parent->kobj, KOBJ_OFFLINE)) {
+	printk(KERN_ERR __FILE__ ", line %d: kobject_uevent_atomic failed\n", __LINE__);
+    }
+}
+
+void resume_tasklet(unsigned long arg)
+{
+	struct fsg_dev *fsg = (struct fsg_dev *)arg;
+
+	if (kobject_uevent_atomic(&fsg->gadget->dev.parent->kobj, KOBJ_ONLINE))
+		printk(KERN_ERR __FILE__ ", line %d: kobject_uevent_atomic failed\n", __LINE__);
+}
 
 /*-------------------------------------------------------------------------*/
 
@@ -4182,9 +4294,22 @@ static void fsg_suspend(struct usb_gadget *gadget)
 {
 	struct fsg_dev		*fsg = get_gadget_data(gadget);
 
+	cancel_delayed_work(&fsg->synchronize_cache_work);
+
 	DBG(fsg, "suspend\n");
 	set_bit(SUSPENDED, &fsg->atomic_bitflags);
-}
+
+	if (fsg->curlun != NULL) {
+		fsg->curlun->prevent_medium_removal = 0;
+		if (!recovery_mode && test_and_clear_bit(ONLINE, &fsg->atomic_bitflags)) {
+		    tasklet_schedule(&fsg->susp_task);
+		}
+		else {
+			fsg->gadget->configured = 0;
+		}
+		set_drivemode_online(test_bit(ONLINE, &fsg->atomic_bitflags));
+	}
+};
 
 static void fsg_resume(struct usb_gadget *gadget)
 {
@@ -4192,6 +4317,20 @@ static void fsg_resume(struct usb_gadget *gadget)
 
 	DBG(fsg, "resume\n");
 	clear_bit(SUSPENDED, &fsg->atomic_bitflags);
+
+#ifdef CONFIG_MACH_MX50_YOSHIME
+	/*
+	 * The yoshime platform doesn't properly reattach to USB hosts going from
+	 * suspend to resume when the USB bus remains under power. This makes sure
+	 * the resume event is raise through the device stack.
+	 */
+	if (fsg->curlun != NULL) {
+		if (!recovery_mode && !test_and_set_bit(ONLINE, &fsg->atomic_bitflags))
+			tasklet_schedule(&fsg->resm_task);
+
+		set_drivemode_online(test_bit(ONLINE, &fsg->atomic_bitflags));
+	}
+#endif
 }
 
 
@@ -4233,6 +4372,9 @@ static int __init fsg_alloc(void)
 	kref_init(&fsg->ref);
 	init_completion(&fsg->thread_notifier);
 
+	tasklet_init(&fsg->susp_task, suspend_tasklet, (unsigned long) fsg);
+	tasklet_init(&fsg->resm_task, resume_tasklet, (unsigned long) fsg);
+
 	the_fsg = fsg;
 	return 0;
 }
@@ -4243,6 +4385,9 @@ static int __init fsg_init(void)
 	int		rc;
 	struct fsg_dev	*fsg;
 
+#if defined(CONFIG_MACH_MX50_YOSHI) || defined(CONFIG_MACH_MX50_YOSHIME)
+	set_drivemode_online(0);
+#endif
 	if ((rc = fsg_alloc()) != 0)
 		return rc;
 	fsg = the_fsg;
@@ -4257,6 +4402,9 @@ static void __exit fsg_cleanup(void)
 {
 	struct fsg_dev	*fsg = the_fsg;
 
+	tasklet_kill(&fsg->susp_task);
+	tasklet_kill(&fsg->resm_task);
+
 	/* Unregister the driver iff the thread hasn't already done so */
 	if (test_and_clear_bit(REGISTERED, &fsg->atomic_bitflags))
 		usb_gadget_unregister_driver(&fsg_driver);
@@ -4264,6 +4412,7 @@ static void __exit fsg_cleanup(void)
 	/* Wait for the thread to finish up */
 	wait_for_completion(&fsg->thread_notifier);
 
+	close_all_backing_files(fsg);
 	kref_put(&fsg->ref, fsg_release);
 }
 module_exit(fsg_cleanup);

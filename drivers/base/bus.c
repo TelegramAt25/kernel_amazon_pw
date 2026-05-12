@@ -702,9 +702,9 @@ int bus_add_driver(struct device_driver *drv)
 	kobject_uevent(&priv->kobj, KOBJ_ADD);
 	return 0;
 out_unregister:
+	kobject_put(&priv->kobj);
 	kfree(drv->p);
 	drv->p = NULL;
-	kobject_put(&priv->kobj);
 out_put_bus:
 	bus_put(bus);
 	return error;
